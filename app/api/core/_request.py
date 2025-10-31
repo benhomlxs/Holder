@@ -2,6 +2,7 @@ from datetime import datetime
 from abc import ABC
 from typing import Optional, Union, Dict, Any, Type, TypeVar
 import httpx
+import asyncio
 from pydantic import BaseModel
 from app.settings.log import logger
 
@@ -21,7 +22,11 @@ class ApiRequest(ABC):
         Initialize API client
         """
         self.host = host.rstrip("/")
-        self._client = httpx.AsyncClient(timeout=5.0, verify=False)
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0, connect=5.0, read=10.0),
+            verify=False,
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50)
+        )
 
     def _get_headers(self, access: Optional[str] = None) -> Dict[str, str]:
         """
@@ -42,42 +47,71 @@ class ApiRequest(ABC):
         data: Optional[Union[BaseModel, Dict[str, Any]]] = None,
         params: Optional[Dict[str, Any]] = None,
         response_model: Optional[Type[T]] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
     ) -> Union[httpx.Response, T, bool]:
         """
-        Generic request method with flexible parameters and empty response handling
+        Generic request method with retry mechanism and exponential backoff
         """
-        try:
-            headers = self._get_headers(access)
-            clean_data = self._clean_payload(data)
-            clean_params = self._clean_payload(params)
-            full_url = f"{self.host}/{endpoint.lstrip('/')}"
-            response = await self._client.request(
-                method,
-                full_url,
-                headers=headers,
-                data=clean_data if not access else None,
-                json=clean_data if access else None,
-                params=clean_params,
-            )
-            response.raise_for_status()
+        headers = self._get_headers(access)
+        clean_data = self._clean_payload(data)
+        clean_params = self._clean_payload(params)
+        full_url = f"{self.host}/{endpoint.lstrip('/')}"
+        
+        last_exception = None
+        
+        for attempt in range(max_retries + 1):
+            try:
+                # Add small delay between requests to avoid overwhelming server
+                if attempt > 0:
+                    delay = backoff_factor * (1.5 ** (attempt - 1))  # Gentler backoff
+                    await asyncio.sleep(delay)
+                    logger.info(f"Retrying request (attempt {attempt + 1}/{max_retries + 1}) after {delay:.1f}s delay")
+                
+                response = await self._client.request(
+                    method,
+                    full_url,
+                    headers=headers,
+                    data=clean_data if not access else None,
+                    json=clean_data if access else None,
+                    params=clean_params,
+                )
+                response.raise_for_status()
 
-            if not response.content:
-                if response.status_code in [200, 201, 204]:
-                    return True
+                if not response.content:
+                    if response.status_code in [200, 201, 204]:
+                        return True
+                    return False
+
+                if response_model:
+                    return response_model(**response.json())
+
+                jsonres = response.json()
+                return jsonres if jsonres != {} else True
+
+            except httpx.HTTPStatusError as e:
+                last_exception = e
+                # Retry on server errors (5xx) and rate limiting (429)
+                if e.response.status_code in [429, 500, 502, 503, 504] and attempt < max_retries:
+                    logger.warning(f"HTTP error {e.response.status_code}, retrying... (attempt {attempt + 1}/{max_retries + 1})")
+                    continue
+                else:
+                    logger.error(f"HTTP error occurred: {str(e)}")
+                    return False
+            except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError) as e:
+                last_exception = e
+                if attempt < max_retries:
+                    logger.warning(f"Network error, retrying... (attempt {attempt + 1}/{max_retries + 1}): {str(e)}")
+                    continue
+                else:
+                    logger.error(f"Network error after {max_retries + 1} attempts: {str(e)}")
+                    return False
+            except Exception as e:
+                logger.error(f"Unexpected error: {str(e)}")
                 return False
-
-            if response_model:
-                return response_model(**response.json())
-
-            jsonres = response.json()
-            return jsonres if jsonres != {} else True
-
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error occurred: {str(e)}")
-            return False
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            return False
+        
+        logger.error(f"Request failed after {max_retries + 1} attempts. Last error: {str(last_exception)}")
+        return False
 
     def _clean_payload(
         self, payload: Optional[Union[BaseModel, Dict[str, Any]]]
@@ -156,9 +190,11 @@ class ApiRequest(ABC):
         data: Optional[Union[BaseModel, Dict[str, Any]]] = None,
         params: Optional[Dict[str, Any]] = None,
         response_model: Optional[Type[T]] = None,
+        max_retries: int = 3,
+        backoff_factor: float = 1.0,
     ) -> Union[httpx.Response, T]:
         """
-        Perform a PUT request
+        Perform a PUT request with retry mechanism
         """
         return await self._request(
             "PUT",
@@ -167,6 +203,8 @@ class ApiRequest(ABC):
             response_model=response_model,
             params=params,
             access=access,
+            max_retries=max_retries,
+            backoff_factor=backoff_factor,
         )
 
     async def delete(

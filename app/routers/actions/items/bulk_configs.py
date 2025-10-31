@@ -4,6 +4,7 @@ Bulk service assignment module for managing multiple services and admins
 import asyncio
 import logging
 from typing import List, Dict, Any, Optional
+from datetime import datetime, timedelta
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.filters import StateFilter
@@ -35,13 +36,52 @@ class BulkConfigForm(StatesGroup):
     PROCESSING = State()
 
 
+class CircuitBreaker:
+    """Simple circuit breaker to prevent server overload"""
+    
+    def __init__(self, failure_threshold: int = 8, recovery_timeout: int = 20):
+        self.failure_threshold = failure_threshold
+        self.recovery_timeout = recovery_timeout
+        self.failure_count = 0
+        self.last_failure_time = None
+        self.state = "CLOSED"  # CLOSED, OPEN, HALF_OPEN
+    
+    def can_execute(self) -> bool:
+        """Check if request can be executed"""
+        if self.state == "CLOSED":
+            return True
+        elif self.state == "OPEN":
+            if self.last_failure_time and \
+               datetime.now() - self.last_failure_time > timedelta(seconds=self.recovery_timeout):
+                self.state = "HALF_OPEN"
+                return True
+            return False
+        else:  # HALF_OPEN
+            return True
+    
+    def record_success(self):
+        """Record successful request"""
+        self.failure_count = 0
+        self.state = "CLOSED"
+    
+    def record_failure(self):
+        """Record failed request"""
+        self.failure_count += 1
+        self.last_failure_time = datetime.now()
+        if self.failure_count >= self.failure_threshold:
+            self.state = "OPEN"
+            logger.warning(f"Circuit breaker opened after {self.failure_count} failures")
+
+
 class BulkOperationManager:
     """Manager for bulk operations with optimized batch processing"""
     
-    def __init__(self, batch_size: int = 20, concurrent_limit: int = 5):
+    def __init__(self, batch_size: int = 12, concurrent_limit: int = 3, rate_limit_delay: float = 0.05):
         self.batch_size = batch_size
         self.concurrent_limit = concurrent_limit
+        self.rate_limit_delay = rate_limit_delay  # Delay between requests
         self.progress_updates = {}
+        self.circuit_breaker = CircuitBreaker(failure_threshold=6, recovery_timeout=15)
         
     async def process_bulk_assignment(
         self,
@@ -114,7 +154,7 @@ class BulkOperationManager:
                 server,
                 page,
                 size=server.size_value,
-                owner_username=None if admin == "ALL" else admin
+                owner_username=admin
             )
             
             if not users:
@@ -169,30 +209,37 @@ class BulkOperationManager:
                 )
                 tasks.append(task)
         
-        # Process with concurrency limit
+        # Process with concurrency limit and better error handling
         semaphore = asyncio.Semaphore(self.concurrent_limit)
         
         async def limited_task(task):
             async with semaphore:
-                return await task
+                try:
+                    return await task
+                except Exception as e:
+                    logger.error(f"Task failed with exception: {e}")
+                    return "failed"
         
-        # Execute all tasks
+        # Execute all tasks with proper exception handling
         results = await asyncio.gather(
             *(limited_task(task) for task in tasks),
-            return_exceptions=True
+            return_exceptions=False  # Don't return exceptions, handle them in limited_task
         )
         
-        # Count results
+        # Count results - only count actual operations, not skipped ones
         for res in results:
-            result["operations"] += 1
             if isinstance(res, Exception):
+                result["operations"] += 1
                 result["failed"] += 1
                 result["errors"].append(str(res))
             elif res == "success":
+                result["operations"] += 1
                 result["successful"] += 1
             elif res == "skipped":
                 result["skipped"] += 1
+                # Don't count skipped operations in total operations
             else:
+                result["operations"] += 1
                 result["failed"] += 1
                 
         return result
@@ -204,8 +251,19 @@ class BulkOperationManager:
         service_id: int,
         action_type: str
     ) -> str:
-        """Process a single service for a single user"""
+        """Process a single service for a single user with rate limiting and circuit breaker"""
         try:
+            # Check circuit breaker
+            if not self.circuit_breaker.can_execute():
+                logger.warning(f"Circuit breaker is open, skipping {user.username}")
+                return "failed"
+            
+            # Add minimal rate limiting delay only when needed
+            if self.circuit_breaker.failure_count > 2:
+                await asyncio.sleep(self.rate_limit_delay * 2)  # Increase delay if errors occur
+            else:
+                await asyncio.sleep(self.rate_limit_delay)  # Minimal delay for normal operation
+            
             # Validate user data
             validation_error = validate_user_data(user)
             if validation_error:
@@ -213,6 +271,8 @@ class BulkOperationManager:
             
             # Check if action is needed
             needs_update = False
+            original_service_ids = user.service_ids.copy()
+            
             if action_type == ActionTypes.ADD_CONFIG.value:
                 if service_id not in user.service_ids:
                     user.service_ids.append(service_id)
@@ -225,13 +285,29 @@ class BulkOperationManager:
             if not needs_update:
                 return "skipped"
             
-            # Prepare and send update
+            # Prepare and send update with retry mechanism
             modify_data = prepare_user_modify_data(user, preserve_all=True)
+            
+            # Use the improved API client with retry
             result = await ClinetManager.modify_user(
                 server=server,
                 username=user.username,
                 data=modify_data
             )
+            
+            # Update circuit breaker based on result
+            if result:
+                self.circuit_breaker.record_success()
+                # Reduce delay on success for adaptive speed
+                if self.rate_limit_delay > 0.02:
+                    self.rate_limit_delay *= 0.95
+            else:
+                self.circuit_breaker.record_failure()
+                # Increase delay on failure for stability
+                if self.rate_limit_delay < 0.5:
+                    self.rate_limit_delay *= 1.2
+                # If API call failed, restore original service_ids
+                user.service_ids = original_service_ids
             
             # Log the operation
             action_name = "add" if action_type == ActionTypes.ADD_CONFIG.value else "remove"
@@ -247,11 +323,16 @@ class BulkOperationManager:
             
         except Exception as e:
             logger.error(f"Error processing {user.username} for service {service_id}: {e}")
+            self.circuit_breaker.record_failure()
             return "failed"
 
 
-# Initialize the bulk operation manager
-bulk_manager = BulkOperationManager()
+# Initialize the bulk operation manager with optimized settings
+bulk_manager = BulkOperationManager(
+    batch_size=12,  # Balanced batch size for optimal throughput
+    concurrent_limit=3,  # Moderate concurrency for speed without overload
+    rate_limit_delay=0.05  # Minimal delay for maximum speed
+)
 
 
 
@@ -311,10 +392,9 @@ async def _start_bulk_workflow(
     
     # Show admin selection with checkboxes
     admin_list = [admin.username for admin in admins]
-    admin_list.append("ALL")  # Add option to select all admins
     
     return await callback.message.edit_text(
-        text="📋 **Select Admins**\n\nChoose one or more admins whose users will be affected:",
+        text="📋 Select Admins\n\nChoose one or more admins whose users will be affected:",
         reply_markup=BotKeys.selector(
             data=admin_list,
             types=Pages.BULK_CONFIG,
@@ -351,7 +431,6 @@ async def toggle_admin_selection(callback: CallbackQuery, callback_data: SelectC
     # Get all admins for the list
     admins = await ClinetManager.get_admins(server=server)
     admin_list = [admin.username for admin in admins]
-    admin_list.append("ALL")
     
     # Handle select all/deselect all
     if callback_data.select == SelectAll.SELECT:
@@ -369,7 +448,7 @@ async def toggle_admin_selection(callback: CallbackQuery, callback_data: SelectC
     
     # Update the keyboard with new selection
     return await callback.message.edit_text(
-        text=f"📋 **Select Admins**\n\nSelected: {len(selected_admins)}/{len(admin_list)}\n\nChoose admins whose users will be affected:",
+        text=f"📋 Select Admins\n\nSelected: {len(selected_admins)}/{len(admin_list)}\n\nChoose admins whose users will be affected:",
         reply_markup=BotKeys.selector(
             data=admin_list,
             types=Pages.BULK_CONFIG,
@@ -430,7 +509,7 @@ async def admins_selected(callback: CallbackQuery, callback_data: SelectCB, stat
         admins_text += f" and {len(selected_admins) - 5} more"
     
     return await callback.message.edit_text(
-        text=f"🔧 **Select Services**\n\nAdmins: {admins_text}\n\nChoose services to assign/remove:",
+        text=f"🔧 Select Services\n\nAdmins: {admins_text}\n\nChoose services to assign/remove:",
         reply_markup=BotKeys.selector(
             data=service_list,
             types=Pages.BULK_CONFIG,
@@ -490,7 +569,7 @@ async def toggle_service_selection(callback: CallbackQuery, callback_data: Selec
     
     # Update the keyboard with new selection
     return await callback.message.edit_text(
-        text=f"🔧 **Select Services**\n\nAdmins: {admins_text}\nSelected: {len(selected_services)}/{len(service_list)}\n\nChoose services to assign/remove:",
+        text=f"🔧 Select Services\n\nAdmins: {admins_text}\nSelected: {len(selected_services)}/{len(service_list)}\n\nChoose services to assign/remove:",
         reply_markup=BotKeys.selector(
             data=service_list,
             types=Pages.BULK_CONFIG,
@@ -543,7 +622,7 @@ async def services_selected(callback: CallbackQuery, callback_data: SelectCB, st
         services_text += f" and {len(service_names) - 5} more"
     
     confirmation_text = (
-        f"⚠️ **Confirm Bulk Operation**\n\n"
+        f"⚠️ Confirm Bulk Operation\n\n"
         f"Action: {action_text} users\n"
         f"Admins: {admins_text}\n"
         f"Services: {services_text}\n\n"
@@ -609,7 +688,7 @@ async def process_bulk_operation(callback: CallbackQuery, callback_data: SelectC
     
     # Initial progress message
     progress_msg = await callback.message.edit_text(
-        text="⏳ **Processing Bulk Operation**\n\nInitializing..."
+        text="⏳ Processing Bulk Operation\n\nInitializing..."
     )
     
     # Progress callback for updates
@@ -617,7 +696,7 @@ async def process_bulk_operation(callback: CallbackQuery, callback_data: SelectC
         """Update progress message during processing"""
         try:
             progress_text = (
-                f"⏳ **Processing Bulk Operation**\n\n"
+                f"⏳ Processing Bulk Operation\n\n"
                 f"Current Admin: {admin}\n"
                 f"Users Processed: {result['total_users']}\n"
                 f"Operations: {result['operations']}\n"
@@ -651,21 +730,22 @@ async def process_bulk_operation(callback: CallbackQuery, callback_data: SelectC
             services_text += f" and {len(service_names) - 3} more"
         
         result_text = (
-            f"✅ **Bulk Operation Completed!**\n\n"
-            f"**Action:** {action_text} services\n"
-            f"**Admins:** {admins_text}\n"
-            f"**Services:** {services_text}\n\n"
-            f"**Results:**\n"
+            f"✅ Bulk Operation Completed!\n\n"
+            f"Action: {action_text} services\n"
+            f"Admins: {admins_text}\n"
+            f"Services: {services_text}\n\n"
+            f"Results:\n"
             f"Total Users: {results['total_users']}\n"
             f"Total Operations: {results['total_operations']}\n"
             f"✅ Successful: {results['successful']}\n"
             f"⏭️ Skipped: {results['skipped']}\n"
-            f"❌ Failed: {results['failed']}"
+            f"❌ Failed: {results['failed']}\n\n"
+            f"Note: Operations count only includes actual API calls (successful + failed), not skipped items."
         )
         
         if results['errors']:
             error_sample = results['errors'][:3]
-            result_text += f"\n\n**Sample Errors:**\n"
+            result_text += f"\n\nSample Errors:\n"
             for error in error_sample:
                 result_text += f"• {error[:50]}...\n"
         
@@ -677,7 +757,7 @@ async def process_bulk_operation(callback: CallbackQuery, callback_data: SelectC
     except Exception as e:
         logger.error(f"Bulk operation failed: {e}")
         track = await callback.message.edit_text(
-            text=f"❌ **Operation Failed**\n\nError: {str(e)}",
+            text=f"❌ Operation Failed\n\nError: {str(e)}",
             reply_markup=BotKeys.cancel(server_back=server.id)
         )
     

@@ -75,6 +75,8 @@ class MarzneshinApiManager(ApiRequest):
             access=access,
             data=data,
             response_model=MarzneshinUserResponse,
+            max_retries=2,
+            backoff_factor=0.3,
         )
 
     async def get_services(
