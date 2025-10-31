@@ -3,13 +3,14 @@ from enum import Enum
 
 class Pages(str, Enum):
     HOME = "home"
-    SERVERS = "servers"
     MENU = "menu"
     USERS = "users"
+    SERVERS = "servers"
     ACTIONS = "actions"
-    UPDATE = "update"
-    TEMPLATES = "templates"
     STATS = "stats"
+    TEMPLATES = "templates"
+    UPDATE = "update"
+    BULK_CONFIG = "bulk_config"
 
 
 class Actions(str, Enum):
@@ -19,6 +20,9 @@ class Actions(str, Enum):
     MODIFY = "modify"
     SEARCH = "search"
     JSON = "json"
+    SELECT_ADMIN = "select_admin"
+    SELECT_SERVICE = "select_service"
+    CONFIRM = "confirm"
 
 
 class YesOrNot(str, Enum):

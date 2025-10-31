@@ -31,6 +31,8 @@ async def data(callback: CallbackQuery, callback_data: PageCB):
     if server.types == ServerTypes.MARZNESHIN.value:
         menu_keys.append(ActionTypes.ADD_CONFIG)
         menu_keys.append(ActionTypes.DELETE_CONFIG)
+        menu_keys.append((ActionTypes.ADD_CONFIG.value + " (Bulk)", ActionTypes.ADD_CONFIG.value + " (Bulk)"))
+        menu_keys.append((ActionTypes.DELETE_CONFIG.value + " (Bulk)", ActionTypes.DELETE_CONFIG.value + " (Bulk)"))
     return await callback.message.edit_text(
         text=MessageTexts.ITEMS,
         reply_markup=BotKeys.selector(
