@@ -10,8 +10,8 @@ def setup_action_routers() -> Router:
     router = Router()
 
     router.include_router(menu.router)
+    router.include_router(bulk_configs.router)  # Move bulk_configs before configs
     router.include_router(configs.router)
-    router.include_router(bulk_configs.router)
     router.include_router(users.router)
     router.include_router(admin.router)
 

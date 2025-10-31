@@ -22,6 +22,9 @@ from .config_helper import prepare_user_modify_data, validate_user_data, log_use
 router = Router(name="bulk_configs")
 logger = logging.getLogger(__name__)
 
+# Configure logging to see debug messages
+logging.basicConfig(level=logging.INFO)
+
 
 class BulkConfigForm(StatesGroup):
     """States for bulk configuration workflow"""
@@ -251,27 +254,30 @@ class BulkOperationManager:
 bulk_manager = BulkOperationManager()
 
 
+
 @router.callback_query(
     SelectCB.filter(
-        (F.types.is_(Pages.ACTIONS))
-        & (F.action.is_(Actions.INFO))
-        & (F.select.is_(ActionTypes.ADD_CONFIG.value + " (Bulk)"))
+        (F.types == Pages.ACTIONS)
+        & (F.action == Actions.INFO)
+        & (F.select == ActionTypes.ADD_CONFIG.value + " (Bulk)")
     )
 )
 async def start_bulk_add(callback: CallbackQuery, callback_data: SelectCB, state: FSMContext):
     """Start bulk add configuration workflow"""
+    logger.info(f"Bulk add handler triggered - callback_data: {callback_data}")
     await _start_bulk_workflow(callback, callback_data, state, ActionTypes.ADD_CONFIG.value)
 
 
 @router.callback_query(
     SelectCB.filter(
-        (F.types.is_(Pages.ACTIONS))
-        & (F.action.is_(Actions.INFO))
-        & (F.select.is_(ActionTypes.DELETE_CONFIG.value + " (Bulk)"))
+        (F.types == Pages.ACTIONS)
+        & (F.action == Actions.INFO)
+        & (F.select == ActionTypes.DELETE_CONFIG.value + " (Bulk)")
     )
 )
 async def start_bulk_delete(callback: CallbackQuery, callback_data: SelectCB, state: FSMContext):
     """Start bulk delete configuration workflow"""
+    logger.info(f"Bulk delete handler triggered - callback_data: {callback_data}")
     await _start_bulk_workflow(callback, callback_data, state, ActionTypes.DELETE_CONFIG.value)
 
 
@@ -282,6 +288,7 @@ async def _start_bulk_workflow(
     action_type: str
 ):
     """Common workflow starter for bulk operations"""
+    logger.info(f"Starting bulk workflow - action_type: {action_type}, panel: {callback_data.panel}")
     server = await crud.get_server(callback_data.panel)
     if not server:
         track = await callback.message.edit_text(
