@@ -37,7 +37,7 @@ class ClinetApiManager:
                 token = await api.get_token(data["username"], data["password"])
                 if token:
                     admin = await api.get_admin(access=token.access_token)
-                    token = token.access_token if admin.is_sudo else False
+                    token = token.access_token if admin and admin.is_sudo else False
 
         return token
 
