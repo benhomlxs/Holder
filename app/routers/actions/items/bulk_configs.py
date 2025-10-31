@@ -111,22 +111,25 @@ class BulkOperationManager:
             "failed": 0,
             "skipped": 0,
             "errors": [],
-            "admin_results": {}
+            "admin_results": {},
+            "processed_users": set()  # Track unique users to avoid double counting
         }
         
         for admin in admins:
             admin_result = await self._process_admin_users(
-                server, admin, service_ids, action_type, progress_callback
+                server, admin, service_ids, action_type, progress_callback, results["processed_users"]
             )
             results["admin_results"][admin] = admin_result
-            results["total_users"] += admin_result["total_users"]
+            results["total_users"] = len(results["processed_users"])  # Count unique users
             results["total_operations"] += admin_result["operations"]
             results["successful"] += admin_result["successful"]
             results["failed"] += admin_result["failed"]
             results["skipped"] += admin_result["skipped"]
             if admin_result["errors"]:
                 results["errors"].extend(admin_result["errors"])
-                
+        
+        # Remove the set from final results (not needed in output)
+        del results["processed_users"]
         return results
     
     async def _process_admin_users(
@@ -135,7 +138,8 @@ class BulkOperationManager:
         admin: str,
         service_ids: List[int],
         action_type: str,
-        progress_callback=None
+        progress_callback=None,
+        processed_users_set=None
     ) -> Dict[str, Any]:
         """Process all users for a single admin"""
         result = {
@@ -147,7 +151,12 @@ class BulkOperationManager:
             "errors": []
         }
         
+        if processed_users_set is None:
+            processed_users_set = set()
+        
         page = 1
+        admin_users_count = 0
+        
         while True:
             # Fetch users for this admin
             users = await ClinetManager.get_users(
@@ -159,8 +168,11 @@ class BulkOperationManager:
             
             if not users:
                 break
-                
-            result["total_users"] += len(users)
+            
+            # Count unique users for this admin
+            for user in users:
+                processed_users_set.add(user.username)
+                admin_users_count += 1
             
             # Process users in batches
             for i in range(0, len(users), self.batch_size):
@@ -178,10 +190,14 @@ class BulkOperationManager:
                 
                 # Send progress update if callback provided
                 if progress_callback:
-                    await progress_callback(admin, result)
+                    # Update with current unique user count
+                    temp_result = result.copy()
+                    temp_result["total_users"] = len(processed_users_set)
+                    await progress_callback(admin, temp_result)
                     
             page += 1
             
+        result["total_users"] = admin_users_count  # Users for this specific admin
         return result
     
     async def _process_user_batch(
