@@ -1,0 +1,5 @@
+FROM erfjab/holderbot:latest
+
+# Copy modified files
+COPY app/settings/tasks/items/node_states.py /code/app/settings/tasks/items/
+COPY app/settings/tasks/items/nodes.py /code/app/settings/tasks/items/
