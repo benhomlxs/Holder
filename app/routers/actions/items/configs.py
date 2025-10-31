@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from aiogram import Router, F
 from aiogram.types import CallbackQuery
 from aiogram.filters import StateFilter
@@ -11,7 +12,10 @@ from app.settings.language import MessageTexts
 from app.settings.track import tracker
 from app.models.action import ActionTypes
 from app.api import ClinetManager
-from app.api.types.marzneshin import MarzneshinUserResponse
+from app.api.types.marzneshin import MarzneshinUserResponse, UserExpireStrategy
+from .config_helper import prepare_user_modify_data, validate_user_data, log_user_modification
+
+logger = logging.getLogger(__name__)
 
 router = Router(name="actions_add_config")
 
@@ -124,45 +128,75 @@ async def action(callback: CallbackQuery, callback_data: SelectCB, state: FSMCon
         )
         return await tracker.add(track)
 
-    await callback.message.edit_text(text="⏳")
+    # Send progress message
+    progress_msg = await callback.message.edit_text(text="⏳ Processing users...")
 
     target = int(target_config["id"])
     action_type = data["action"]
-
-    global all_users
+    adminselect = data["admin"]
 
     async def process_user(user: MarzneshinUserResponse):
-        global all_users
-        if action_type == ActionTypes.ADD_CONFIG.value:
-            if target not in user.service_ids:
+        """Process a single user - add or remove service"""
+        try:
+            # Validate user data first
+            validation_error = validate_user_data(user)
+            if validation_error:
+                logger.warning(validation_error)
+            
+            # Check if action is needed
+            if action_type == ActionTypes.ADD_CONFIG.value:
+                if target in user.service_ids:
+                    return None  # Already has the service
                 user.service_ids.append(target)
-                all_users += 1
-            else:
-                return False
-        elif action_type == ActionTypes.DELETE_CONFIG.value:
-            if target in user.service_ids:
+                action_name = "add"
+            elif action_type == ActionTypes.DELETE_CONFIG.value:
+                if target not in user.service_ids:
+                    return None  # Doesn't have the service
                 user.service_ids.remove(target)
-                all_users += 1
-
+                action_name = "remove"
             else:
-                return False
+                return None
 
-        modify = await ClinetManager.modify_user(
-            server=server,
-            username=user.username,
-            data={
-                "username": user.username,
-                "service_ids": user.service_ids,
-            },
-        )
-        return modify
+            # Use helper to prepare data with all fields preserved
+            modify_data = prepare_user_modify_data(user, preserve_all=True)
+            
+            # Call API to modify user
+            result = await ClinetManager.modify_user(
+                server=server,
+                username=user.username,
+                data=modify_data,
+            )
+            
+            # Log the result
+            log_user_modification(
+                username=user.username,
+                action=action_name,
+                service_id=target,
+                success=bool(result),
+                error=None if result else "API call failed"
+            )
+            
+            return result
+        except Exception as e:
+            logger.error(f"Error processing user {user.username}: {e}")
+            log_user_modification(
+                username=user.username,
+                action=action_type,
+                service_id=target,
+                success=False,
+                error=str(e)
+            )
+            return None
 
+    # Process users in batches
     page = 1
-    all_users = 0
-    success = 0
+    total_processed = 0
+    success_count = 0
+    failed_count = 0
+    batch_size = 10  # Process 10 users concurrently
 
     while True:
-        adminselect = data["admin"]
+        # Get users page
         users = await ClinetManager.get_users(
             server,
             page,
@@ -172,13 +206,46 @@ async def action(callback: CallbackQuery, callback_data: SelectCB, state: FSMCon
         if not users:
             break
 
-        results = await asyncio.gather(*(process_user(user) for user in users))
-        success += sum(1 for result in results if result)
+        # Process users in smaller batches for better performance
+        for i in range(0, len(users), batch_size):
+            batch = users[i:i+batch_size]
+            results = await asyncio.gather(
+                *(process_user(user) for user in batch),
+                return_exceptions=True
+            )
+            
+            for result in results:
+                if result is not None:
+                    if isinstance(result, Exception):
+                        failed_count += 1
+                    elif result:
+                        success_count += 1
+                    else:
+                        failed_count += 1
+                total_processed += 1
+            
+            # Update progress every batch
+            if total_processed % 50 == 0:
+                await progress_msg.edit_text(
+                    text=f"⏳ Processing... {total_processed} users processed"
+                )
 
         page += 1
 
+    # Send final result
+    action_text = "Added" if action_type == ActionTypes.ADD_CONFIG.value else "Removed"
+    result_text = (
+        f"✅ Action Completed!\n\n"
+        f"Service: {target_config['remark']}\n"
+        f"Action: {action_text}\n"
+        f"Admin: {adminselect}\n"
+        f"Success: {success_count}\n"
+        f"Failed: {failed_count}\n"
+        f"Total Processed: {total_processed}"
+    )
+    
     track = await callback.message.answer(
-        text=f"Action Finished: {success}/{all_users}",
+        text=result_text,
         reply_markup=BotKeys.cancel(server_back=server.id),
     )
     return await tracker.cleardelete(callback, track)
