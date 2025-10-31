@@ -115,6 +115,9 @@ class BulkOperationManager:
             "processed_users": set()  # Track unique users to avoid double counting
         }
         
+        # Track processed user-service pairs to avoid double counting
+        processed_operations = set()
+        
         for admin in admins:
             admin_result = await self._process_admin_users(
                 server, admin, service_ids, action_type, progress_callback, results["processed_users"]
@@ -127,6 +130,15 @@ class BulkOperationManager:
             results["skipped"] += admin_result["skipped"]
             if admin_result["errors"]:
                 results["errors"].extend(admin_result["errors"])
+        
+        # Validate final numbers for debugging
+        total_expected = len(results["processed_users"]) * len(service_ids)
+        total_actual = results["total_operations"] + results["skipped"]
+        
+        if total_expected != total_actual:
+            logger.warning(f"Calculation mismatch: Expected {total_expected}, Got {total_actual}")
+            logger.warning(f"Users: {len(results['processed_users'])}, Services: {len(service_ids)}")
+            logger.warning(f"Operations: {results['total_operations']}, Skipped: {results['skipped']}")
         
         # Remove the set from final results (not needed in output)
         del results["processed_users"]
@@ -169,14 +181,21 @@ class BulkOperationManager:
             if not users:
                 break
             
-            # Count unique users for this admin
+            # Filter users that haven't been processed yet (avoid duplicate processing)
+            new_users = []
             for user in users:
-                processed_users_set.add(user.username)
-                admin_users_count += 1
+                if user.username not in processed_users_set:
+                    processed_users_set.add(user.username)
+                    new_users.append(user)
+                    admin_users_count += 1
+                # If user already processed by another admin, skip processing
             
             # Process users in batches
-            for i in range(0, len(users), self.batch_size):
-                batch = users[i:i+self.batch_size]
+            for i in range(0, len(new_users), self.batch_size):
+                batch = new_users[i:i+self.batch_size]
+                if not batch:  # Skip empty batches
+                    continue
+                
                 batch_results = await self._process_user_batch(
                     server, batch, service_ids, action_type
                 )
