@@ -191,7 +191,7 @@ class BulkOperationManager:
         service_ids: List[int],
         action_type: str
     ) -> Dict[str, Any]:
-        """Process a batch of users concurrently"""
+        """Process a batch of users concurrently - optimized approach"""
         result = {
             "operations": 0,
             "successful": 0,
@@ -200,14 +200,34 @@ class BulkOperationManager:
             "errors": []
         }
         
-        # Create tasks for concurrent processing
+        # Create tasks for users that need processing (pre-filter)
         tasks = []
+        user_service_pairs = []
+        
         for user in users:
             for service_id in service_ids:
-                task = self._process_single_user_service(
-                    server, user, service_id, action_type
-                )
-                tasks.append(task)
+                # Pre-check if action is needed to avoid unnecessary tasks
+                needs_update = False
+                if action_type == ActionTypes.ADD_CONFIG.value:
+                    if service_id not in user.service_ids:
+                        needs_update = True
+                elif action_type == ActionTypes.DELETE_CONFIG.value:
+                    if service_id in user.service_ids:
+                        needs_update = True
+                
+                if needs_update:
+                    task = self._process_single_user_service(
+                        server, user, service_id, action_type
+                    )
+                    tasks.append(task)
+                    user_service_pairs.append((user.username, service_id))
+                else:
+                    # Count skipped operations immediately
+                    result["skipped"] += 1
+        
+        if not tasks:
+            # All operations were skipped
+            return result
         
         # Process with concurrency limit and better error handling
         semaphore = asyncio.Semaphore(self.concurrent_limit)
@@ -220,14 +240,14 @@ class BulkOperationManager:
                     logger.error(f"Task failed with exception: {e}")
                     return "failed"
         
-        # Execute all tasks with proper exception handling
+        # Execute only necessary tasks
         results = await asyncio.gather(
             *(limited_task(task) for task in tasks),
-            return_exceptions=False  # Don't return exceptions, handle them in limited_task
+            return_exceptions=False
         )
         
-        # Count results - only count actual operations, not skipped ones
-        for res in results:
+        # Count results - only actual API calls
+        for i, res in enumerate(results):
             if isinstance(res, Exception):
                 result["operations"] += 1
                 result["failed"] += 1
@@ -235,12 +255,10 @@ class BulkOperationManager:
             elif res == "success":
                 result["operations"] += 1
                 result["successful"] += 1
-            elif res == "skipped":
-                result["skipped"] += 1
-                # Don't count skipped operations in total operations
-            else:
+            elif res == "failed":
                 result["operations"] += 1
                 result["failed"] += 1
+            # Note: "skipped" results shouldn't happen here since we pre-filtered
                 
         return result
     
@@ -251,7 +269,7 @@ class BulkOperationManager:
         service_id: int,
         action_type: str
     ) -> str:
-        """Process a single service for a single user with rate limiting and circuit breaker"""
+        """Process a single service for a single user - only called when update is needed"""
         try:
             # Check circuit breaker
             if not self.circuit_breaker.can_execute():
@@ -260,30 +278,22 @@ class BulkOperationManager:
             
             # Add minimal rate limiting delay only when needed
             if self.circuit_breaker.failure_count > 2:
-                await asyncio.sleep(self.rate_limit_delay * 2)  # Increase delay if errors occur
+                await asyncio.sleep(self.rate_limit_delay * 2)
             else:
-                await asyncio.sleep(self.rate_limit_delay)  # Minimal delay for normal operation
+                await asyncio.sleep(self.rate_limit_delay)
             
             # Validate user data
             validation_error = validate_user_data(user)
             if validation_error:
                 logger.warning(f"Validation error for {user.username}: {validation_error}")
             
-            # Check if action is needed
-            needs_update = False
+            # Apply the change (we know it's needed since we pre-filtered)
             original_service_ids = user.service_ids.copy()
             
             if action_type == ActionTypes.ADD_CONFIG.value:
-                if service_id not in user.service_ids:
-                    user.service_ids.append(service_id)
-                    needs_update = True
+                user.service_ids.append(service_id)
             elif action_type == ActionTypes.DELETE_CONFIG.value:
-                if service_id in user.service_ids:
-                    user.service_ids.remove(service_id)
-                    needs_update = True
-            
-            if not needs_update:
-                return "skipped"
+                user.service_ids.remove(service_id)
             
             # Prepare and send update with retry mechanism
             modify_data = prepare_user_modify_data(user, preserve_all=True)
