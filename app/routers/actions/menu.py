@@ -33,6 +33,10 @@ async def data(callback: CallbackQuery, callback_data: PageCB):
         menu_keys.append(ActionTypes.DELETE_CONFIG)
         menu_keys.append(ActionTypes.ADD_CONFIG.value + " (Bulk)")
         menu_keys.append(ActionTypes.DELETE_CONFIG.value + " (Bulk)")
+    
+    # Add bulk cleanup options for both server types
+    menu_keys.append("Bulk User Cleanup")
+    menu_keys.append("Scheduled Cleanup")
     return await callback.message.edit_text(
         text=MessageTexts.ITEMS,
         reply_markup=BotKeys.selector(

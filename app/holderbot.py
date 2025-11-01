@@ -7,6 +7,7 @@ from app.settings.tasks import tasker
 from app.settings.track import tracker
 from app.routers import setup_routers
 from app.settings.middlewares import CheckUserAccess
+from app.scheduler.cleanup_scheduler import cleanup_scheduler
 from .bot import bot
 from .version import __version__
 
@@ -18,6 +19,7 @@ async def main() -> None:
         dp.include_router(router=setup_routers())
         dp.update.middleware(CheckUserAccess())
         await tasker.start()
+        await cleanup_scheduler.start()  # Start the cleanup scheduler
         await bot.delete_webhook(True)
         logger.info(f"Start Polling {__version__}")
         await dp.start_polling(bot)
